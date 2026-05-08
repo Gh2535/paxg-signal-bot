@@ -2,9 +2,7 @@ name: BTC Signal Bot v2
 
 on:
   workflow_dispatch:
-  schedule:
-    - cron: "12,27,42,57 * * * *"
-
+  
 permissions:
   contents: write
 
