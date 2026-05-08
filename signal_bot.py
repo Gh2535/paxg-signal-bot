@@ -39,6 +39,11 @@ MIN_ADX_15M = 18.0
 MIN_VOLUME_RATIO = 0.45
 MAX_RECENT_MOVE_PERCENT = 0.75
 
+# الان این دو فقط برای ارزیابی و قدرت سیگنال استفاده می‌شوند، نه شرط قطعی ورود.
+# اگر بعداً خواستیم ربات سخت‌گیرتر شود، این دو را True می‌کنیم.
+REQUIRE_ADX_FOR_ENTRY = False
+REQUIRE_VOLUME_FOR_ENTRY = False
+
 IMPORTANT_NEWS_KEYWORDS = [
     "cpi",
     "consumer price",
@@ -851,6 +856,9 @@ def calculate_signal():
     adx_ok = adx >= MIN_ADX_15M
     volume_ok = volume_ratio >= MIN_VOLUME_RATIO
 
+    adx_entry_ok = adx_ok or not REQUIRE_ADX_FOR_ENTRY
+    volume_entry_ok = volume_ok or not REQUIRE_VOLUME_FOR_ENTRY
+
     recent_start_close = df_15m.iloc[-5]["close"]
     recent_move_percent = abs(price - recent_start_close) / recent_start_close * 100
     recent_move_ok = recent_move_percent <= MAX_RECENT_MOVE_PERCENT
@@ -864,8 +872,8 @@ def calculate_signal():
         and price_long
         and not_too_far
         and volatility_ok
-        and adx_ok
-        and volume_ok
+        and adx_entry_ok
+        and volume_entry_ok
         and recent_move_ok
     ):
         technical_signal = "LONG"
@@ -877,8 +885,8 @@ def calculate_signal():
         and price_short
         and not_too_far
         and volatility_ok
-        and adx_ok
-        and volume_ok
+        and adx_entry_ok
+        and volume_entry_ok
         and recent_move_ok
     ):
         technical_signal = "SHORT"
@@ -1021,12 +1029,18 @@ This is paper trading only. No real order was sent.
     if adx_ok:
         reasons.append(f"قدرت روند با ADX قابل قبول است: {adx:.2f}")
     else:
-        reasons.append(f"ADX ضعیف است؛ احتمال رنج بودن بازار بالاتر است: {adx:.2f}")
+        if REQUIRE_ADX_FOR_ENTRY:
+            reasons.append(f"ADX ضعیف است و چون شرط ورود فعال است، ورود حذف شد: {adx:.2f}")
+        else:
+            reasons.append(f"ADX ضعیف است؛ فقط هشدار است و شرط قطعی ورود نیست: {adx:.2f}")
 
     if volume_ok:
         reasons.append(f"حجم قابل قبول است؛ Volume Ratio = {volume_ratio:.2f}")
     else:
-        reasons.append(f"حجم ضعیف است؛ Volume Ratio = {volume_ratio:.2f}")
+        if REQUIRE_VOLUME_FOR_ENTRY:
+            reasons.append(f"حجم ضعیف است و چون شرط ورود فعال است، ورود حذف شد: Volume Ratio = {volume_ratio:.2f}")
+        else:
+            reasons.append(f"حجم ضعیف است؛ فقط هشدار است و شرط قطعی ورود نیست: Volume Ratio = {volume_ratio:.2f}")
 
     if recent_move_ok:
         reasons.append(f"حرکت چند کندل اخیر بیش از حد تند نیست: {recent_move_percent:.3f}%")
@@ -1118,10 +1132,12 @@ EMA200: {ema200:.2f}
 RSI: {rsi:.2f}
 MACD Hist: {macd_hist:.4f}
 ADX: {adx:.2f}
+ADX Required For Entry: {REQUIRE_ADX_FOR_ENTRY}
 ATR: {atr:.2f}
 ATR%: {atr_percent:.3f}%
 Distance from EMA20: {distance_from_ema20:.3f}%
 Volume Ratio: {volume_ratio:.2f}
+Volume Required For Entry: {REQUIRE_VOLUME_FOR_ENTRY}
 Recent Move: {recent_move_percent:.3f}%
 
 --- 1h Closed Candle ---
