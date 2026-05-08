@@ -14,6 +14,8 @@ LIMIT = 250
 TP_PERCENT = 1.0
 SL_PERCENT = 0.6
 
+MAX_SPREAD_PERCENT = 0.10
+
 
 def send_telegram(message):
     telegram_url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
@@ -41,7 +43,7 @@ def get_klines(symbol, interval, limit):
     data = response.json()
 
     if not isinstance(data, list):
-        raise Exception(f"MEXC error: {data}")
+        raise Exception(f"MEXC klines error: {data}")
 
     df = pd.DataFrame(data)
     df = df.iloc[:, :6]
@@ -51,6 +53,33 @@ def get_klines(symbol, interval, limit):
         df[col] = df[col].astype(float)
 
     return df
+
+
+def get_spread(symbol):
+    url = "https://api.mexc.com/api/v3/ticker/bookTicker"
+    params = {
+        "symbol": symbol
+    }
+
+    response = requests.get(url, params=params, timeout=20)
+    data = response.json()
+
+    if not isinstance(data, dict):
+        raise Exception(f"MEXC spread error: {data}")
+
+    if "bidPrice" not in data or "askPrice" not in data:
+        raise Exception(f"MEXC spread response missing bid/ask: {data}")
+
+    bid = float(data["bidPrice"])
+    ask = float(data["askPrice"])
+
+    if bid <= 0 or ask <= 0:
+        raise Exception(f"Invalid bid/ask: bid={bid}, ask={ask}")
+
+    mid = (bid + ask) / 2
+    spread_percent = (ask - bid) / mid * 100
+
+    return bid, ask, spread_percent
 
 
 def add_indicators(df):
@@ -75,12 +104,17 @@ def add_indicators(df):
 
 
 def calculate_signal():
+    # Market spread
+    bid, ask, spread_percent = get_spread(SYMBOL)
+    spread_ok = spread_percent <= MAX_SPREAD_PERCENT
+
     # 15m data
     df_15m = get_klines(SYMBOL, "15m", LIMIT)
     df_15m = add_indicators(df_15m)
     latest_15m = df_15m.iloc[-1]
 
-    # 1h data
+    # 1h confirmation data
+    # MEXC uses 60m instead of 1h for this symbol
     df_1h = get_klines(SYMBOL, "60m", LIMIT)
     df_1h = add_indicators(df_1h)
     latest_1h = df_1h.iloc[-1]
@@ -132,6 +166,7 @@ def calculate_signal():
         and price_long
         and not_too_far
         and volatility_ok
+        and spread_ok
     ):
         signal = "LONG"
 
@@ -142,6 +177,7 @@ def calculate_signal():
         and price_short
         and not_too_far
         and volatility_ok
+        and spread_ok
     ):
         signal = "SHORT"
 
@@ -166,9 +202,12 @@ def calculate_signal():
     if volatility_ok:
         score += 1
 
-    if score >= 6:
+    if spread_ok:
+        score += 1
+
+    if score >= 7:
         strength = "Strong"
-    elif score >= 4:
+    elif score >= 5:
         strength = "Medium"
     else:
         strength = "Weak"
@@ -195,17 +234,18 @@ def calculate_signal():
     else:
         reasons.append("مومنتوم 15m ضعیف یا خنثی است.")
 
-    if not price_long and signal == "LONG":
-        reasons.append("قیمت بالای EMA50 نیست.")
-
-    if not price_short and signal == "SHORT":
-        reasons.append("قیمت پایین EMA50 نیست.")
-
     if not not_too_far:
         reasons.append(f"قیمت از EMA20 زیاد دور شده است: {distance_from_ema20:.3f}%")
 
     if not volatility_ok:
         reasons.append(f"نوسان کافی نیست: ATR% = {atr_percent:.3f}%")
+
+    if spread_ok:
+        reasons.append(f"اسپرد قابل قبول است: {spread_percent:.4f}%")
+    else:
+        reasons.append(
+            f"اسپرد زیاد است: {spread_percent:.4f}%؛ حد مجاز: {MAX_SPREAD_PERCENT:.2f}%"
+        )
 
     if signal == "NO TRADE":
         reasons.append("همه شروط ورود همزمان کامل نشده‌اند.")
@@ -235,6 +275,12 @@ Signal: {signal}
 Strength: {strength}
 
 Price: {price:.2f}
+
+--- Market Spread ---
+Bid: {bid:.2f}
+Ask: {ask:.2f}
+Spread: {spread_percent:.4f}%
+Max Allowed Spread: {MAX_SPREAD_PERCENT:.2f}%
 
 --- 15m ---
 EMA20: {ema20:.2f}
