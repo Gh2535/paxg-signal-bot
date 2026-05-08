@@ -8,6 +8,8 @@ from ta.trend import EMAIndicator, MACD, ADXIndicator
 from ta.momentum import RSIIndicator
 from ta.volatility import AverageTrueRange
 
+TURKEY_TZ = timezone(timedelta(hours=3))
+
 BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 FINNHUB_API_KEY = os.environ.get("FINNHUB_API_KEY", "")
@@ -67,8 +69,8 @@ IMPORTANT_NEWS_KEYWORDS = [
 
 
 SIGNAL_FIELDNAMES = [
-    "timestamp_utc",
-    "signal_candle_time",
+    "timestamp_turkey",
+    "signal_candle_time_turkey",
     "symbol",
     "technical_signal",
     "final_signal",
@@ -103,10 +105,10 @@ TRADE_FIELDNAMES = [
     "symbol",
     "side",
     "status",
-    "open_time_utc",
-    "close_time_utc",
-    "signal_candle_time",
-    "last_checked_candle_time",
+    "open_time_turkey",
+    "close_time_turkey",
+    "signal_candle_time_turkey",
+    "last_checked_candle_time_turkey",
     "entry",
     "tp",
     "sl",
@@ -132,6 +134,23 @@ TRADE_FIELDNAMES = [
     "news_risk_at_entry",
     "news_summary_at_entry"
 ]
+
+
+def format_turkey_time(dt_utc):
+    try:
+        dt_tr = dt_utc.astimezone(TURKEY_TZ)
+        return dt_tr.strftime("%Y-%m-%d %H:%M:%S TR")
+    except Exception:
+        return str(dt_utc)
+
+
+def format_mexc_timestamp(timestamp_ms):
+    try:
+        timestamp_ms = int(timestamp_ms)
+        dt = datetime.fromtimestamp(timestamp_ms / 1000, tz=timezone.utc)
+        return format_turkey_time(dt)
+    except Exception:
+        return str(timestamp_ms)
 
 
 def send_telegram(message):
@@ -231,17 +250,7 @@ def add_indicators(df):
 
 
 def get_latest_closed_candle(df):
-    # آخرین کندل معمولاً در حال تشکیل است؛ برای تصمیم‌گیری از کندل بسته‌شده قبلی استفاده می‌کنیم.
     return df.iloc[-2]
-
-
-def format_mexc_timestamp(timestamp_ms):
-    try:
-        timestamp_ms = int(timestamp_ms)
-        dt = datetime.fromtimestamp(timestamp_ms / 1000, tz=timezone.utc)
-        return dt.strftime("%Y-%m-%d %H:%M:%S UTC")
-    except Exception:
-        return str(timestamp_ms)
 
 
 def parse_finnhub_time(value):
@@ -412,7 +421,7 @@ def format_news_events(events):
     for event in events:
         event_time = event.get("time")
         if event_time:
-            time_text = event_time.strftime("%Y-%m-%d %H:%M UTC")
+            time_text = format_turkey_time(event_time)
         else:
             time_text = str(event.get("time_raw", "Unknown time"))
 
@@ -446,7 +455,7 @@ def ensure_csv_header(file_name, fieldnames):
         return
 
     try:
-        with open(file_path, mode="r", encoding="utf-8") as f:
+        with open(file_path, mode="r", encoding="utf-8-sig") as f:
             reader = csv.DictReader(f)
             existing_rows = list(reader)
             existing_fields = reader.fieldnames or []
@@ -456,7 +465,7 @@ def ensure_csv_header(file_name, fieldnames):
     if existing_fields == fieldnames:
         return
 
-    with open(file_path, mode="w", newline="", encoding="utf-8") as f:
+    with open(file_path, mode="w", newline="", encoding="utf-8-sig") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
 
@@ -471,7 +480,7 @@ def append_signal_log(row):
     file_path = Path(SIGNALS_LOG_FILE)
     file_exists = file_path.exists()
 
-    with open(file_path, mode="a", newline="", encoding="utf-8") as f:
+    with open(file_path, mode="a", newline="", encoding="utf-8-sig") as f:
         writer = csv.DictWriter(f, fieldnames=SIGNAL_FIELDNAMES)
 
         if not file_exists:
@@ -488,7 +497,7 @@ def read_trades():
     if not file_path.exists():
         return []
 
-    with open(file_path, mode="r", encoding="utf-8") as f:
+    with open(file_path, mode="r", encoding="utf-8-sig") as f:
         reader = csv.DictReader(f)
         return list(reader)
 
@@ -496,7 +505,7 @@ def read_trades():
 def write_trades(trades):
     file_path = Path(PAPER_TRADES_FILE)
 
-    with open(file_path, mode="w", newline="", encoding="utf-8") as f:
+    with open(file_path, mode="w", newline="", encoding="utf-8-sig") as f:
         writer = csv.DictWriter(f, fieldnames=TRADE_FIELDNAMES)
         writer.writeheader()
 
@@ -525,7 +534,9 @@ def parse_int(value, default=0):
 
 def parse_log_timestamp(value):
     try:
-        return datetime.strptime(value, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+        clean_value = str(value).replace(" TR", "").strip()
+        dt_tr = datetime.strptime(clean_value, "%Y-%m-%d %H:%M:%S").replace(tzinfo=TURKEY_TZ)
+        return dt_tr.astimezone(timezone.utc)
     except Exception:
         return None
 
@@ -539,14 +550,16 @@ def is_duplicate_recent(now_utc, technical_signal, final_signal, block_reason):
     cutoff = now_utc - timedelta(minutes=DUPLICATE_SUPPRESSION_MINUTES)
 
     try:
-        with open(file_path, mode="r", encoding="utf-8") as f:
+        with open(file_path, mode="r", encoding="utf-8-sig") as f:
             reader = csv.DictReader(f)
             rows = list(reader)
     except Exception:
         return False
 
     for row in reversed(rows):
-        row_time = parse_log_timestamp(row.get("timestamp_utc", ""))
+        row_time = parse_log_timestamp(
+            row.get("timestamp_turkey", "") or row.get("timestamp_utc", "")
+        )
 
         if row_time is None:
             continue
@@ -595,7 +608,7 @@ def update_open_paper_trades(latest_15m, now_utc):
         if trade.get("status") != "OPEN":
             continue
 
-        if trade.get("last_checked_candle_time") == candle_time:
+        if trade.get("last_checked_candle_time_turkey") == candle_time:
             continue
 
         side = trade.get("side")
@@ -611,7 +624,7 @@ def update_open_paper_trades(latest_15m, now_utc):
 
         trade["max_high_seen"] = round(max_high_seen, 4)
         trade["min_low_seen"] = round(min_low_seen, 4)
-        trade["last_checked_candle_time"] = candle_time
+        trade["last_checked_candle_time_turkey"] = candle_time
 
         bars_held = parse_int(trade.get("bars_held"), 0) + 1
         trade["bars_held"] = bars_held
@@ -675,7 +688,7 @@ def update_open_paper_trades(latest_15m, now_utc):
             net_profit_percent = gross_profit_percent - ESTIMATED_ROUND_TRIP_FEE_PERCENT
 
             trade["status"] = "CLOSED"
-            trade["close_time_utc"] = now_utc.strftime("%Y-%m-%d %H:%M:%S")
+            trade["close_time_turkey"] = format_turkey_time(now_utc)
             trade["exit_price"] = round(exit_price, 4)
             trade["result"] = result
             trade["gross_profit_percent"] = round(gross_profit_percent, 4)
@@ -742,10 +755,10 @@ def create_paper_trade(
         "symbol": SYMBOL,
         "side": side,
         "status": "OPEN",
-        "open_time_utc": now_utc.strftime("%Y-%m-%d %H:%M:%S"),
-        "close_time_utc": "",
-        "signal_candle_time": signal_candle_time,
-        "last_checked_candle_time": signal_candle_time,
+        "open_time_turkey": format_turkey_time(now_utc),
+        "close_time_turkey": "",
+        "signal_candle_time_turkey": signal_candle_time,
+        "last_checked_candle_time_turkey": signal_candle_time,
         "entry": round(entry, 4),
         "tp": round(tp, 4),
         "sl": round(sl, 4),
@@ -1138,8 +1151,8 @@ SL: -
         message += f"\nDuplicate Filter: پیام مشابه در {DUPLICATE_SUPPRESSION_MINUTES} دقیقه اخیر ارسال شده؛ تلگرام دوباره ارسال نمی‌شود.\n"
 
     append_signal_log({
-        "timestamp_utc": now_utc.strftime("%Y-%m-%d %H:%M:%S"),
-        "signal_candle_time": signal_candle_time,
+        "timestamp_turkey": format_turkey_time(now_utc),
+        "signal_candle_time_turkey": signal_candle_time,
         "symbol": SYMBOL,
         "technical_signal": technical_signal,
         "final_signal": final_signal,
