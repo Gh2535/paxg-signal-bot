@@ -849,7 +849,6 @@ def calculate_signal():
     volatility_ok = atr_percent >= 0.10
 
     adx_ok = adx >= MIN_ADX_15M
-
     volume_ok = volume_ratio >= MIN_VOLUME_RATIO
 
     recent_start_close = df_15m.iloc[-5]["close"]
@@ -926,7 +925,11 @@ def calculate_signal():
     if news_ok and news["risk"] in ["LOW", "MEDIUM"]:
         score += 1
 
-    if score >= 10:
+    if technical_signal == "NO TRADE":
+        strength = "No Setup"
+    elif final_signal == "NO TRADE":
+        strength = "Blocked Setup"
+    elif score >= 10:
         strength = "Strong"
     elif score >= 7:
         strength = "Medium"
