@@ -333,20 +333,16 @@ def format_news_events(events):
 
 
 def calculate_signal():
-    # News risk
     news = get_news_risk()
     news_ok = news["trade_allowed"]
 
-    # Market spread
     bid, ask, spread_percent = get_spread(SYMBOL)
     spread_ok = spread_percent <= MAX_SPREAD_PERCENT
 
-    # 15m data
     df_15m = get_klines(SYMBOL, "15m", LIMIT)
     df_15m = add_indicators(df_15m)
     latest_15m = df_15m.iloc[-1]
 
-    # 1h confirmation data
     df_1h = get_klines(SYMBOL, "60m", LIMIT)
     df_1h = add_indicators(df_1h)
     latest_1h = df_1h.iloc[-1]
@@ -365,31 +361,25 @@ def calculate_signal():
     ema200_1h = latest_1h["ema200"]
     rsi_1h = latest_1h["rsi"]
 
-    # Trend filters
     trend_1h_long = ema50_1h > ema200_1h
     trend_1h_short = ema50_1h < ema200_1h
 
     trend_15m_long = ema50 > ema200
     trend_15m_short = ema50 < ema200
 
-    # Momentum filters
     momentum_long = rsi > 52 and macd_hist > 0
     momentum_short = rsi < 48 and macd_hist < 0
 
-    # Price position
     price_long = price > ema50
     price_short = price < ema50
 
-    # Pullback / not chasing filter
     distance_from_ema20 = abs(price - ema20) / price * 100
     not_too_far = distance_from_ema20 <= 0.45
 
-    # Volatility filter
     atr_percent = atr / price * 100
     volatility_ok = atr_percent >= 0.10
 
-    signal = "NO TRADE"
-    reasons = []
+    technical_signal = "NO TRADE"
 
     if (
         trend_1h_long
@@ -398,10 +388,8 @@ def calculate_signal():
         and price_long
         and not_too_far
         and volatility_ok
-        and spread_ok
-        and news_ok
     ):
-        signal = "LONG"
+        technical_signal = "LONG"
 
     elif (
         trend_1h_short
@@ -410,12 +398,23 @@ def calculate_signal():
         and price_short
         and not_too_far
         and volatility_ok
-        and spread_ok
-        and news_ok
     ):
-        signal = "SHORT"
+        technical_signal = "SHORT"
 
-    # Strength score
+    final_signal = technical_signal
+    block_reasons = []
+
+    if technical_signal in ["LONG", "SHORT"]:
+        if not spread_ok:
+            final_signal = "NO TRADE"
+            block_reasons.append("اسپرد بیشتر از حد مجاز است.")
+
+        if not news_ok:
+            final_signal = "NO TRADE"
+            block_reasons.append("ریسک خبری بالا است.")
+
+    reasons = []
+
     score = 0
 
     if trend_1h_long or trend_1h_short:
@@ -449,7 +448,6 @@ def calculate_signal():
     else:
         strength = "Weak"
 
-    # Reasons
     if trend_1h_long:
         reasons.append("روند 1h صعودی است.")
     elif trend_1h_short:
@@ -493,15 +491,17 @@ def calculate_signal():
     else:
         reasons.append("وضعیت خبر نامشخص است؛ با احتیاط.")
 
-    if signal == "NO TRADE":
-        reasons.append("همه شروط ورود همزمان کامل نشده‌اند.")
+    if technical_signal == "NO TRADE":
+        reasons.append("سیگنال تکنیکال کامل نشده است.")
 
-    # TP / SL
-    if signal == "LONG":
+    if technical_signal in ["LONG", "SHORT"] and final_signal == "NO TRADE":
+        reasons.append("سیگنال تکنیکال وجود داشت، اما فیلترهای ریسک اجازه ورود ندادند.")
+
+    if final_signal == "LONG":
         entry = price
         tp = entry * (1 + TP_PERCENT / 100)
         sl = entry * (1 - SL_PERCENT / 100)
-    elif signal == "SHORT":
+    elif final_signal == "SHORT":
         entry = price
         tp = entry * (1 - TP_PERCENT / 100)
         sl = entry * (1 + SL_PERCENT / 100)
@@ -512,6 +512,11 @@ def calculate_signal():
 
     news_events_text = format_news_events(news["events"])
 
+    if block_reasons:
+        block_reason_text = " / ".join(block_reasons)
+    else:
+        block_reason_text = "-"
+
     message = f"""
 PAXG SIGNAL BOT
 
@@ -519,8 +524,10 @@ Symbol: {SYMBOL}
 Main Timeframe: 15m
 Confirm Timeframe: 1h
 
-Signal: {signal}
+Technical Signal: {technical_signal}
+Final Signal: {final_signal}
 Strength: {strength}
+Block Reason: {block_reason_text}
 
 Price: {price:.2f}
 
@@ -553,7 +560,7 @@ EMA200: {ema200_1h:.2f}
 RSI: {rsi_1h:.2f}
 """
 
-    if signal in ["LONG", "SHORT"]:
+    if final_signal in ["LONG", "SHORT"]:
         message += f"""
 Entry: {entry:.2f}
 TP ({TP_PERCENT}%): {tp:.2f}
