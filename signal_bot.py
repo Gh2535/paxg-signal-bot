@@ -24,10 +24,16 @@ NEWS_BLOCK_BEFORE_MINUTES = 90
 NEWS_BLOCK_AFTER_MINUTES = 60
 NEWS_MEDIUM_LOOKAHEAD_HOURS = 24
 
-LOG_FILE = "signals_log.csv"
-
-# اگر در این مدت همان پیام قبلاً ثبت شده باشد، دوباره تلگرام نمی‌فرستد
 DUPLICATE_SUPPRESSION_MINUTES = 60
+
+SIGNALS_LOG_FILE = "signals_log.csv"
+PAPER_TRADES_FILE = "paper_trades.csv"
+
+MAX_OPEN_PAPER_TRADES = 1
+
+# Approximate round-trip fee assumption.
+# This is only for paper trading estimation, not exact exchange settlement.
+ESTIMATED_ROUND_TRIP_FEE_PERCENT = 0.04
 
 IMPORTANT_NEWS_KEYWORDS = [
     "cpi",
@@ -55,6 +61,65 @@ IMPORTANT_NEWS_KEYWORDS = [
     "ism",
     "manufacturing pmi",
     "services pmi",
+]
+
+
+SIGNAL_FIELDNAMES = [
+    "timestamp_utc",
+    "symbol",
+    "technical_signal",
+    "final_signal",
+    "block_reason",
+    "strength",
+    "price",
+    "entry",
+    "tp",
+    "sl",
+    "rsi_15m",
+    "macd_hist_15m",
+    "atr_percent",
+    "distance_from_ema20",
+    "ema50_15m",
+    "ema200_15m",
+    "ema50_1h",
+    "ema200_1h",
+    "rsi_1h",
+    "spread_percent",
+    "news_risk",
+    "news_summary",
+    "telegram_sent",
+    "duplicate_suppressed"
+]
+
+
+TRADE_FIELDNAMES = [
+    "trade_id",
+    "symbol",
+    "side",
+    "status",
+    "open_time_utc",
+    "close_time_utc",
+    "entry",
+    "tp",
+    "sl",
+    "exit_price",
+    "result",
+    "gross_profit_percent",
+    "estimated_fee_percent",
+    "net_profit_percent",
+    "bars_held",
+    "max_high_seen",
+    "min_low_seen",
+    "mfe_percent",
+    "mae_percent",
+    "close_reason",
+    "strength_at_entry",
+    "rsi_15m_at_entry",
+    "macd_hist_15m_at_entry",
+    "atr_percent_at_entry",
+    "spread_percent_at_entry",
+    "news_risk_at_entry",
+    "news_summary_at_entry"
 ]
 
 
@@ -340,43 +405,57 @@ def format_news_events(events):
 
 
 def append_signal_log(row):
-    file_path = Path(LOG_FILE)
+    file_path = Path(SIGNALS_LOG_FILE)
     file_exists = file_path.exists()
 
-    fieldnames = [
-        "timestamp_utc",
-        "symbol",
-        "technical_signal",
-        "final_signal",
-        "block_reason",
-        "strength",
-        "price",
-        "entry",
-        "tp",
-        "sl",
-        "rsi_15m",
-        "macd_hist_15m",
-        "atr_percent",
-        "distance_from_ema20",
-        "ema50_15m",
-        "ema200_15m",
-        "ema50_1h",
-        "ema200_1h",
-        "rsi_1h",
-        "spread_percent",
-        "news_risk",
-        "news_summary",
-        "telegram_sent",
-        "duplicate_suppressed"
-    ]
-
     with open(file_path, mode="a", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer = csv.DictWriter(f, fieldnames=SIGNAL_FIELDNAMES)
 
         if not file_exists:
             writer.writeheader()
 
         writer.writerow(row)
+
+
+def read_trades():
+    file_path = Path(PAPER_TRADES_FILE)
+
+    if not file_path.exists():
+        return []
+
+    with open(file_path, mode="r", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        return list(reader)
+
+
+def write_trades(trades):
+    file_path = Path(PAPER_TRADES_FILE)
+
+    with open(file_path, mode="w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=TRADE_FIELDNAMES)
+        writer.writeheader()
+
+        for trade in trades:
+            cleaned = {field: trade.get(field, "") for field in TRADE_FIELDNAMES}
+            writer.writerow(cleaned)
+
+
+def parse_float(value, default=0.0):
+    try:
+        if value in ["", None]:
+            return default
+        return float(value)
+    except Exception:
+        return default
+
+
+def parse_int(value, default=0):
+    try:
+        if value in ["", None]:
+            return default
+        return int(float(value))
+    except Exception:
+        return default
 
 
 def parse_log_timestamp(value):
@@ -387,7 +466,7 @@ def parse_log_timestamp(value):
 
 
 def is_duplicate_recent(now_utc, technical_signal, final_signal, block_reason):
-    file_path = Path(LOG_FILE)
+    file_path = Path(SIGNALS_LOG_FILE)
 
     if not file_path.exists():
         return False
@@ -416,13 +495,205 @@ def is_duplicate_recent(now_utc, technical_signal, final_signal, block_reason):
             and row.get("block_reason") == block_reason
         )
 
-        # فقط پیام‌هایی که قبلاً واقعاً به تلگرام رفته‌اند مانع تکرار شوند
         was_sent = row.get("telegram_sent") == "yes"
 
         if same_state and was_sent:
             return True
 
     return False
+
+
+def calculate_trade_performance(side, entry, max_high_seen, min_low_seen):
+    if side == "LONG":
+        mfe_percent = (max_high_seen - entry) / entry * 100
+        mae_percent = (min_low_seen - entry) / entry * 100
+    else:
+        mfe_percent = (entry - min_low_seen) / entry * 100
+        mae_percent = (entry - max_high_seen) / entry * 100
+
+    return mfe_percent, mae_percent
+
+
+def update_open_paper_trades(latest_15m, now_utc):
+    trades = read_trades()
+    if not trades:
+        return [], []
+
+    high = float(latest_15m["high"])
+    low = float(latest_15m["low"])
+
+    updated_messages = []
+    changed = False
+
+    for trade in trades:
+        if trade.get("status") != "OPEN":
+            continue
+
+        side = trade.get("side")
+        entry = parse_float(trade.get("entry"))
+        tp = parse_float(trade.get("tp"))
+        sl = parse_float(trade.get("sl"))
+
+        old_max_high = parse_float(trade.get("max_high_seen"), entry)
+        old_min_low = parse_float(trade.get("min_low_seen"), entry)
+
+        max_high_seen = max(old_max_high, high)
+        min_low_seen = min(old_min_low, low)
+
+        trade["max_high_seen"] = round(max_high_seen, 4)
+        trade["min_low_seen"] = round(min_low_seen, 4)
+
+        bars_held = parse_int(trade.get("bars_held"), 0) + 1
+        trade["bars_held"] = bars_held
+
+        mfe_percent, mae_percent = calculate_trade_performance(
+            side=side,
+            entry=entry,
+            max_high_seen=max_high_seen,
+            min_low_seen=min_low_seen
+        )
+
+        trade["mfe_percent"] = round(mfe_percent, 4)
+        trade["mae_percent"] = round(mae_percent, 4)
+
+        close_reason = ""
+        exit_price = None
+        result = ""
+        gross_profit_percent = 0.0
+
+        if side == "LONG":
+            tp_hit = high >= tp
+            sl_hit = low <= sl
+
+            # Conservative assumption:
+            # if both TP and SL touched in the same candle, count it as SL.
+            if tp_hit and sl_hit:
+                close_reason = "TP_AND_SL_SAME_CANDLE_ASSUMED_SL"
+                exit_price = sl
+                result = "LOSS"
+                gross_profit_percent = (exit_price - entry) / entry * 100
+            elif tp_hit:
+                close_reason = "TP_HIT"
+                exit_price = tp
+                result = "WIN"
+                gross_profit_percent = (exit_price - entry) / entry * 100
+            elif sl_hit:
+                close_reason = "SL_HIT"
+                exit_price = sl
+                result = "LOSS"
+                gross_profit_percent = (exit_price - entry) / entry * 100
+
+        elif side == "SHORT":
+            tp_hit = low <= tp
+            sl_hit = high >= sl
+
+            if tp_hit and sl_hit:
+                close_reason = "TP_AND_SL_SAME_CANDLE_ASSUMED_SL"
+                exit_price = sl
+                result = "LOSS"
+                gross_profit_percent = (entry - exit_price) / entry * 100
+            elif tp_hit:
+                close_reason = "TP_HIT"
+                exit_price = tp
+                result = "WIN"
+                gross_profit_percent = (entry - exit_price) / entry * 100
+            elif sl_hit:
+                close_reason = "SL_HIT"
+                exit_price = sl
+                result = "LOSS"
+                gross_profit_percent = (entry - exit_price) / entry * 100
+
+        if close_reason:
+            net_profit_percent = gross_profit_percent - ESTIMATED_ROUND_TRIP_FEE_PERCENT
+
+            trade["status"] = "CLOSED"
+            trade["close_time_utc"] = now_utc.strftime("%Y-%m-%d %H:%M:%S")
+            trade["exit_price"] = round(exit_price, 4)
+            trade["result"] = result
+            trade["gross_profit_percent"] = round(gross_profit_percent, 4)
+            trade["estimated_fee_percent"] = ESTIMATED_ROUND_TRIP_FEE_PERCENT
+            trade["net_profit_percent"] = round(net_profit_percent, 4)
+            trade["close_reason"] = close_reason
+
+            updated_messages.append(
+                f"""
+📌 PAPER TRADE CLOSED
+
+Trade ID: {trade.get("trade_id")}
+Side: {side}
+Result: {result}
+Close Reason: {close_reason}
+
+Entry: {entry:.2f}
+Exit: {exit_price:.2f}
+
+Gross P/L: {gross_profit_percent:.3f}%
+Estimated Fee: {ESTIMATED_ROUND_TRIP_FEE_PERCENT:.3f}%
+Net P/L: {net_profit_percent:.3f}%
+
+Bars Held: {bars_held}
+MFE: {mfe_percent:.3f}%
+MAE: {mae_percent:.3f}%
+"""
+            )
+
+        changed = True
+
+    if changed:
+        write_trades(trades)
+
+    return trades, updated_messages
+
+
+def count_open_trades(trades):
+    return sum(1 for trade in trades if trade.get("status") == "OPEN")
+
+
+def create_paper_trade(
+    now_utc,
+    side,
+    entry,
+    tp,
+    sl,
+    strength,
+    rsi,
+    macd_hist,
+    atr_percent,
+    spread_percent,
+    news_risk,
+    news_summary
+):
+    trade_id = f"{now_utc.strftime('%Y%m%d%H%M%S')}_{side}"
+
+    return {
+        "trade_id": trade_id,
+        "symbol": SYMBOL,
+        "side": side,
+        "status": "OPEN",
+        "open_time_utc": now_utc.strftime("%Y-%m-%d %H:%M:%S"),
+        "close_time_utc": "",
+        "entry": round(entry, 4),
+        "tp": round(tp, 4),
+        "sl": round(sl, 4),
+        "exit_price": "",
+        "result": "",
+        "gross_profit_percent": "",
+        "estimated_fee_percent": ESTIMATED_ROUND_TRIP_FEE_PERCENT,
+        "net_profit_percent": "",
+        "bars_held": 0,
+        "max_high_seen": round(entry, 4),
+        "min_low_seen": round(entry, 4),
+        "mfe_percent": 0,
+        "mae_percent": 0,
+        "close_reason": "",
+        "strength_at_entry": strength,
+        "rsi_15m_at_entry": round(rsi, 4),
+        "macd_hist_15m_at_entry": round(macd_hist, 6),
+        "atr_percent_at_entry": round(atr_percent, 6),
+        "spread_percent_at_entry": round(spread_percent, 6),
+        "news_risk_at_entry": news_risk,
+        "news_summary_at_entry": news_summary
+    }
 
 
 def calculate_signal():
@@ -441,6 +712,9 @@ def calculate_signal():
     df_1h = get_klines(SYMBOL, "60m", LIMIT)
     df_1h = add_indicators(df_1h)
     latest_1h = df_1h.iloc[-1]
+
+    # First update already-open paper trades.
+    trades, trade_update_messages = update_open_paper_trades(latest_15m, now_utc)
 
     price = latest_15m["close"]
 
@@ -546,6 +820,61 @@ def calculate_signal():
     else:
         strength = "Weak"
 
+    if final_signal == "LONG":
+        entry = price
+        tp = entry * (1 + TP_PERCENT / 100)
+        sl = entry * (1 - SL_PERCENT / 100)
+    elif final_signal == "SHORT":
+        entry = price
+        tp = entry * (1 - TP_PERCENT / 100)
+        sl = entry * (1 + SL_PERCENT / 100)
+    else:
+        entry = None
+        tp = None
+        sl = None
+
+    paper_trade_message = ""
+    paper_trade_created = False
+
+    current_open_trades = count_open_trades(read_trades())
+
+    if final_signal in ["LONG", "SHORT"] and current_open_trades < MAX_OPEN_PAPER_TRADES:
+        new_trade = create_paper_trade(
+            now_utc=now_utc,
+            side=final_signal,
+            entry=entry,
+            tp=tp,
+            sl=sl,
+            strength=strength,
+            rsi=rsi,
+            macd_hist=macd_hist,
+            atr_percent=atr_percent,
+            spread_percent=spread_percent,
+            news_risk=news["risk"],
+            news_summary=news["summary"]
+        )
+
+        all_trades = read_trades()
+        all_trades.append(new_trade)
+        write_trades(all_trades)
+        paper_trade_created = True
+
+        paper_trade_message = f"""
+🧪 PAPER TRADE OPENED
+
+Trade ID: {new_trade["trade_id"]}
+Side: {final_signal}
+
+Entry: {entry:.2f}
+TP: {tp:.2f}
+SL: {sl:.2f}
+
+This is paper trading only. No real order was sent.
+"""
+
+    elif final_signal in ["LONG", "SHORT"] and current_open_trades >= MAX_OPEN_PAPER_TRADES:
+        block_reason_text += " / معامله فرضی باز وجود دارد؛ معامله جدید ثبت نشد."
+
     reasons = []
 
     if trend_1h_long:
@@ -597,23 +926,14 @@ def calculate_signal():
     if technical_signal in ["LONG", "SHORT"] and final_signal == "NO TRADE":
         reasons.append("سیگنال تکنیکال وجود داشت، اما فیلترهای ریسک اجازه ورود ندادند.")
 
-    if final_signal == "LONG":
-        entry = price
-        tp = entry * (1 + TP_PERCENT / 100)
-        sl = entry * (1 - SL_PERCENT / 100)
-    elif final_signal == "SHORT":
-        entry = price
-        tp = entry * (1 - TP_PERCENT / 100)
-        sl = entry * (1 + SL_PERCENT / 100)
-    else:
-        entry = None
-        tp = None
-        sl = None
+    news_events_text = format_news_events(news["events"])
 
     should_send_message_raw = (
         final_signal in ["LONG", "SHORT"]
         or technical_signal in ["LONG", "SHORT"]
         or bool(block_reasons)
+        or paper_trade_created
+        or len(trade_update_messages) > 0
     )
 
     duplicate_recent = False
@@ -626,9 +946,7 @@ def calculate_signal():
             block_reason=block_reason_text
         )
 
-    should_send_message = should_send_message_raw and not duplicate_recent
-
-    news_events_text = format_news_events(news["events"])
+    should_send_signal_message = should_send_message_raw and not duplicate_recent
 
     message = f"""
 PAXG SIGNAL BOT
@@ -690,6 +1008,9 @@ SL: -
     for reason in reasons:
         message += f"- {reason}\n"
 
+    if paper_trade_message:
+        message += "\n" + paper_trade_message
+
     if duplicate_recent:
         message += f"\nDuplicate Filter: پیام مشابه در {DUPLICATE_SUPPRESSION_MINUTES} دقیقه اخیر ارسال شده؛ تلگرام دوباره ارسال نمی‌شود.\n"
 
@@ -716,23 +1037,26 @@ SL: -
         "spread_percent": round(spread_percent, 6),
         "news_risk": news["risk"],
         "news_summary": news["summary"],
-        "telegram_sent": "yes" if should_send_message else "no",
+        "telegram_sent": "yes" if should_send_signal_message else "no",
         "duplicate_suppressed": "yes" if duplicate_recent else "no"
     })
 
-    return message, should_send_message
+    return message, should_send_signal_message, trade_update_messages
 
 
 if __name__ == "__main__":
     try:
-        message, should_send_message = calculate_signal()
+        message, should_send_signal_message, trade_update_messages = calculate_signal()
 
         print(message)
 
-        if should_send_message:
+        for trade_message in trade_update_messages:
+            send_telegram(trade_message)
+
+        if should_send_signal_message:
             send_telegram(message)
         else:
-            print("No Telegram message sent.")
+            print("No signal Telegram message sent.")
 
     except Exception as e:
         error_message = f"❌ PAXG Signal Bot Error:\n{str(e)}"
