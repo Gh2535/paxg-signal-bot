@@ -235,6 +235,15 @@ def get_latest_closed_candle(df):
     return df.iloc[-2]
 
 
+def format_mexc_timestamp(timestamp_ms):
+    try:
+        timestamp_ms = int(timestamp_ms)
+        dt = datetime.fromtimestamp(timestamp_ms / 1000, tz=timezone.utc)
+        return dt.strftime("%Y-%m-%d %H:%M:%S UTC")
+    except Exception:
+        return str(timestamp_ms)
+
+
 def parse_finnhub_time(value):
     if not value:
         return None
@@ -575,7 +584,7 @@ def update_open_paper_trades(latest_15m, now_utc):
     if not trades:
         return [], []
 
-    candle_time = str(int(latest_15m["time"]))
+    candle_time = format_mexc_timestamp(latest_15m["time"])
     high = float(latest_15m["high"])
     low = float(latest_15m["low"])
 
@@ -783,7 +792,7 @@ def calculate_signal():
 
     trades, trade_update_messages = update_open_paper_trades(latest_15m, now_utc)
 
-    signal_candle_time = str(int(latest_15m["time"]))
+    signal_candle_time = format_mexc_timestamp(latest_15m["time"])
 
     price = latest_15m["close"]
 
