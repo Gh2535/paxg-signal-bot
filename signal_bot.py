@@ -1,12 +1,14 @@
 import os
 import requests
 import pandas as pd
+from datetime import datetime, timedelta, timezone
 from ta.trend import EMAIndicator, MACD
 from ta.momentum import RSIIndicator
 from ta.volatility import AverageTrueRange
 
 BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
+FINNHUB_API_KEY = os.environ.get("FINNHUB_API_KEY", "")
 
 SYMBOL = "GOLD(PAXG)USDT"
 LIMIT = 250
@@ -15,6 +17,38 @@ TP_PERCENT = 1.0
 SL_PERCENT = 0.6
 
 MAX_SPREAD_PERCENT = 0.10
+
+NEWS_BLOCK_BEFORE_MINUTES = 90
+NEWS_BLOCK_AFTER_MINUTES = 60
+NEWS_MEDIUM_LOOKAHEAD_HOURS = 24
+
+IMPORTANT_NEWS_KEYWORDS = [
+    "cpi",
+    "consumer price",
+    "inflation",
+    "ppi",
+    "producer price",
+    "non farm",
+    "non-farm",
+    "nfp",
+    "payroll",
+    "unemployment",
+    "jobless",
+    "fomc",
+    "federal funds",
+    "fed interest",
+    "interest rate",
+    "rate decision",
+    "powell",
+    "federal reserve",
+    "gdp",
+    "retail sales",
+    "pce",
+    "core pce",
+    "ism",
+    "manufacturing pmi",
+    "services pmi",
+]
 
 
 def send_telegram(message):
@@ -103,7 +137,206 @@ def add_indicators(df):
     return df
 
 
+def parse_finnhub_time(value):
+    if not value:
+        return None
+
+    value = str(value).strip()
+
+    formats = [
+        "%Y-%m-%d %H:%M:%S",
+        "%Y-%m-%d %H:%M",
+        "%Y-%m-%dT%H:%M:%S",
+        "%Y-%m-%dT%H:%M:%SZ",
+    ]
+
+    for fmt in formats:
+        try:
+            dt = datetime.strptime(value, fmt)
+            return dt.replace(tzinfo=timezone.utc)
+        except ValueError:
+            pass
+
+    try:
+        dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+    except Exception:
+        return None
+
+
+def is_us_event(event):
+    country = str(event.get("country", "")).lower()
+    return country in ["us", "usa", "united states", "united states of america"]
+
+
+def is_important_gold_event(event):
+    title = str(event.get("event", "")).lower()
+    return any(keyword in title for keyword in IMPORTANT_NEWS_KEYWORDS)
+
+
+def get_news_risk():
+    if not FINNHUB_API_KEY:
+        return {
+            "risk": "UNKNOWN",
+            "trade_allowed": True,
+            "summary": "FINNHUB_API_KEY تنظیم نشده است.",
+            "events": []
+        }
+
+    now = datetime.now(timezone.utc)
+    date_from = now.date().isoformat()
+    date_to = (now + timedelta(days=1)).date().isoformat()
+
+    url = "https://finnhub.io/api/v1/calendar/economic"
+    params = {
+        "from": date_from,
+        "to": date_to,
+        "token": FINNHUB_API_KEY
+    }
+
+    try:
+        response = requests.get(url, params=params, timeout=25)
+        data = response.json()
+    except Exception as e:
+        return {
+            "risk": "UNKNOWN",
+            "trade_allowed": True,
+            "summary": f"خطا در دریافت تقویم اقتصادی: {str(e)}",
+            "events": []
+        }
+
+    events = data.get("economicCalendar", [])
+
+    if not isinstance(events, list):
+        return {
+            "risk": "UNKNOWN",
+            "trade_allowed": True,
+            "summary": f"پاسخ Finnhub غیرمنتظره بود: {data}",
+            "events": []
+        }
+
+    relevant_events = []
+
+    for event in events:
+        if not is_us_event(event):
+            continue
+
+        if not is_important_gold_event(event):
+            continue
+
+        event_name = str(event.get("event", "Unknown Event"))
+        event_time_raw = event.get("time") or event.get("date")
+        event_time = parse_finnhub_time(event_time_raw)
+
+        relevant_events.append({
+            "name": event_name,
+            "time_raw": event_time_raw,
+            "time": event_time,
+            "actual": event.get("actual", ""),
+            "estimate": event.get("estimate", ""),
+            "previous": event.get("prev", event.get("previous", ""))
+        })
+
+    if not relevant_events:
+        return {
+            "risk": "LOW",
+            "trade_allowed": True,
+            "summary": "خبر مهم اقتصادی آمریکا برای طلا در بازه امروز/فردا پیدا نشد.",
+            "events": []
+        }
+
+    high_risk_events = []
+    medium_risk_events = []
+    unknown_time_events = []
+
+    for event in relevant_events:
+        event_time = event["time"]
+
+        if event_time is None:
+            unknown_time_events.append(event)
+            continue
+
+        minutes_to_event = (event_time - now).total_seconds() / 60
+
+        if -NEWS_BLOCK_AFTER_MINUTES <= minutes_to_event <= NEWS_BLOCK_BEFORE_MINUTES:
+            high_risk_events.append(event)
+        elif 0 < minutes_to_event <= NEWS_MEDIUM_LOOKAHEAD_HOURS * 60:
+            medium_risk_events.append(event)
+
+    if high_risk_events:
+        return {
+            "risk": "HIGH",
+            "trade_allowed": False,
+            "summary": "خبر مهم اقتصادی نزدیک است یا به‌تازگی منتشر شده؛ معامله ممنوع.",
+            "events": high_risk_events[:5]
+        }
+
+    if medium_risk_events:
+        return {
+            "risk": "MEDIUM",
+            "trade_allowed": True,
+            "summary": "خبر مهم اقتصادی در ۲۴ ساعت آینده وجود دارد؛ ریسک سیگنال بالاتر است.",
+            "events": medium_risk_events[:5]
+        }
+
+    if unknown_time_events:
+        return {
+            "risk": "MEDIUM",
+            "trade_allowed": True,
+            "summary": "خبر مهم پیدا شد ولی زمان دقیقش قابل تشخیص نبود؛ احتیاط لازم است.",
+            "events": unknown_time_events[:5]
+        }
+
+    return {
+        "risk": "LOW",
+        "trade_allowed": True,
+        "summary": "خبر مهم نزدیک وجود ندارد.",
+        "events": relevant_events[:5]
+    }
+
+
+def format_news_events(events):
+    if not events:
+        return "- رویداد مهمی برای نمایش نیست.\n"
+
+    text = ""
+    for event in events:
+        event_time = event.get("time")
+        if event_time:
+            time_text = event_time.strftime("%Y-%m-%d %H:%M UTC")
+        else:
+            time_text = str(event.get("time_raw", "Unknown time"))
+
+        name = event.get("name", "Unknown Event")
+        actual = event.get("actual", "")
+        estimate = event.get("estimate", "")
+        previous = event.get("previous", "")
+
+        text += f"- {name} | {time_text}"
+
+        details = []
+        if estimate not in ["", None]:
+            details.append(f"Est: {estimate}")
+        if previous not in ["", None]:
+            details.append(f"Prev: {previous}")
+        if actual not in ["", None]:
+            details.append(f"Actual: {actual}")
+
+        if details:
+            text += " | " + " / ".join(details)
+
+        text += "\n"
+
+    return text
+
+
 def calculate_signal():
+    # News risk
+    news = get_news_risk()
+    news_ok = news["trade_allowed"]
+
     # Market spread
     bid, ask, spread_percent = get_spread(SYMBOL)
     spread_ok = spread_percent <= MAX_SPREAD_PERCENT
@@ -114,7 +347,6 @@ def calculate_signal():
     latest_15m = df_15m.iloc[-1]
 
     # 1h confirmation data
-    # MEXC uses 60m instead of 1h for this symbol
     df_1h = get_klines(SYMBOL, "60m", LIMIT)
     df_1h = add_indicators(df_1h)
     latest_1h = df_1h.iloc[-1]
@@ -167,6 +399,7 @@ def calculate_signal():
         and not_too_far
         and volatility_ok
         and spread_ok
+        and news_ok
     ):
         signal = "LONG"
 
@@ -178,6 +411,7 @@ def calculate_signal():
         and not_too_far
         and volatility_ok
         and spread_ok
+        and news_ok
     ):
         signal = "SHORT"
 
@@ -205,9 +439,12 @@ def calculate_signal():
     if spread_ok:
         score += 1
 
-    if score >= 7:
+    if news_ok and news["risk"] in ["LOW", "MEDIUM"]:
+        score += 1
+
+    if score >= 8:
         strength = "Strong"
-    elif score >= 5:
+    elif score >= 6:
         strength = "Medium"
     else:
         strength = "Weak"
@@ -247,6 +484,15 @@ def calculate_signal():
             f"اسپرد زیاد است: {spread_percent:.4f}%؛ حد مجاز: {MAX_SPREAD_PERCENT:.2f}%"
         )
 
+    if news["risk"] == "HIGH":
+        reasons.append("ریسک خبری بالا است؛ معامله ممنوع.")
+    elif news["risk"] == "MEDIUM":
+        reasons.append("ریسک خبری متوسط است؛ ورود فقط با احتیاط.")
+    elif news["risk"] == "LOW":
+        reasons.append("ریسک خبری فعلاً پایین است.")
+    else:
+        reasons.append("وضعیت خبر نامشخص است؛ با احتیاط.")
+
     if signal == "NO TRADE":
         reasons.append("همه شروط ورود همزمان کامل نشده‌اند.")
 
@@ -264,6 +510,8 @@ def calculate_signal():
         tp = None
         sl = None
 
+    news_events_text = format_news_events(news["events"])
+
     message = f"""
 PAXG SIGNAL BOT
 
@@ -276,6 +524,13 @@ Strength: {strength}
 
 Price: {price:.2f}
 
+--- News Risk ---
+News Risk: {news["risk"]}
+Trading Allowed By News Filter: {news_ok}
+News Summary: {news["summary"]}
+
+Important Events:
+{news_events_text}
 --- Market Spread ---
 Bid: {bid:.2f}
 Ask: {ask:.2f}
