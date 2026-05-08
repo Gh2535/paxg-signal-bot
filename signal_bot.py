@@ -9,18 +9,25 @@ BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 
 SYMBOL = "GOLD(PAXG)USDT"
-INTERVAL = "15m"
 LIMIT = 250
+
+TP_PERCENT = 1.0
+SL_PERCENT = 0.6
+
 
 def send_telegram(message):
     telegram_url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    requests.post(
+    response = requests.post(
         telegram_url,
         data={
             "chat_id": CHAT_ID,
             "text": message
-        }
+        },
+        timeout=20
     )
+    print(response.status_code)
+    print(response.text)
+
 
 def get_klines(symbol, interval, limit):
     url = "https://api.mexc.com/api/v3/klines"
@@ -45,13 +52,15 @@ def get_klines(symbol, interval, limit):
 
     return df
 
+
 def add_indicators(df):
     df["ema20"] = EMAIndicator(close=df["close"], window=20).ema_indicator()
     df["ema50"] = EMAIndicator(close=df["close"], window=50).ema_indicator()
     df["ema200"] = EMAIndicator(close=df["close"], window=200).ema_indicator()
+
     df["rsi"] = RSIIndicator(close=df["close"], window=14).rsi()
 
-    macd = MACD(close=df["close"])
+    macd = MACD(close=df["close"], window_slow=26, window_fast=12, window_sign=9)
     df["macd_hist"] = macd.macd_diff()
 
     atr = AverageTrueRange(
@@ -64,121 +73,211 @@ def add_indicators(df):
 
     return df
 
-df = get_klines(SYMBOL, INTERVAL, LIMIT)
-df = add_indicators(df)
 
-latest = df.iloc[-1]
+def calculate_signal():
+    # 15m data
+    df_15m = get_klines(SYMBOL, "15m", LIMIT)
+    df_15m = add_indicators(df_15m)
+    latest_15m = df_15m.iloc[-1]
 
-price = latest["close"]
-ema20 = latest["ema20"]
-ema50 = latest["ema50"]
-ema200 = latest["ema200"]
-rsi = latest["rsi"]
-macd_hist = latest["macd_hist"]
-atr = latest["atr"]
+    # 1h data
+    df_1h = get_klines(SYMBOL, "1h", LIMIT)
+    df_1h = add_indicators(df_1h)
+    latest_1h = df_1h.iloc[-1]
 
-reasons = []
+    price = latest_15m["close"]
 
-# Trend check
-trend_long = ema50 > ema200
-trend_short = ema50 < ema200
+    ema20 = latest_15m["ema20"]
+    ema50 = latest_15m["ema50"]
+    ema200 = latest_15m["ema200"]
 
-# Momentum check
-momentum_long = rsi > 50 and macd_hist > 0
-momentum_short = rsi < 50 and macd_hist < 0
+    rsi = latest_15m["rsi"]
+    macd_hist = latest_15m["macd_hist"]
+    atr = latest_15m["atr"]
 
-# Price position check
-price_long = price > ema50
-price_short = price < ema50
+    ema50_1h = latest_1h["ema50"]
+    ema200_1h = latest_1h["ema200"]
+    rsi_1h = latest_1h["rsi"]
 
-# Pullback / not chasing filter
-distance_from_ema20 = abs(price - ema20) / price * 100
-not_too_far = distance_from_ema20 <= 0.45
+    # Trend filters
+    trend_1h_long = ema50_1h > ema200_1h
+    trend_1h_short = ema50_1h < ema200_1h
 
-# Volatility filter
-atr_percent = atr / price * 100
-volatility_ok = atr_percent >= 0.10
+    trend_15m_long = ema50 > ema200
+    trend_15m_short = ema50 < ema200
 
-signal = "NO TRADE"
+    # Momentum filters
+    momentum_long = rsi > 52 and macd_hist > 0
+    momentum_short = rsi < 48 and macd_hist < 0
 
-if trend_long and momentum_long and price_long and not_too_far and volatility_ok:
-    signal = "LONG"
-elif trend_short and momentum_short and price_short and not_too_far and volatility_ok:
-    signal = "SHORT"
+    # Price position
+    price_long = price > ema50
+    price_short = price < ema50
 
-# Reasons
-if not trend_long and not trend_short:
-    reasons.append("روند نامشخص است.")
-elif trend_long:
-    reasons.append("روند کلی 15m صعودی است.")
-elif trend_short:
-    reasons.append("روند کلی 15m نزولی است.")
+    # Pullback / not chasing filter
+    distance_from_ema20 = abs(price - ema20) / price * 100
+    not_too_far = distance_from_ema20 <= 0.45
 
-if not momentum_long and not momentum_short:
-    reasons.append("مومنتوم واضح نیست.")
-elif momentum_long:
-    reasons.append("مومنتوم به نفع LONG است.")
-elif momentum_short:
-    reasons.append("مومنتوم به نفع SHORT است.")
+    # Volatility filter
+    atr_percent = atr / price * 100
+    volatility_ok = atr_percent >= 0.10
 
-if not not_too_far:
-    reasons.append(f"قیمت از EMA20 زیاد دور شده است: {distance_from_ema20:.2f}%")
+    signal = "NO TRADE"
+    reasons = []
 
-if not volatility_ok:
-    reasons.append(f"نوسان کم است؛ ATR% = {atr_percent:.3f}%")
+    if (
+        trend_1h_long
+        and trend_15m_long
+        and momentum_long
+        and price_long
+        and not_too_far
+        and volatility_ok
+    ):
+        signal = "LONG"
 
-if signal == "NO TRADE":
-    reasons.append("همه شروط ورود همزمان کامل نشده‌اند.")
+    elif (
+        trend_1h_short
+        and trend_15m_short
+        and momentum_short
+        and price_short
+        and not_too_far
+        and volatility_ok
+    ):
+        signal = "SHORT"
 
-tp_percent = 1.0
-sl_percent = 0.6
+    # Strength score
+    score = 0
 
-if signal == "LONG":
-    entry = price
-    tp = entry * (1 + tp_percent / 100)
-    sl = entry * (1 - sl_percent / 100)
-elif signal == "SHORT":
-    entry = price
-    tp = entry * (1 - tp_percent / 100)
-    sl = entry * (1 + sl_percent / 100)
-else:
-    entry = None
-    tp = None
-    sl = None
+    if trend_1h_long or trend_1h_short:
+        score += 1
 
-message = f"""
+    if trend_15m_long or trend_15m_short:
+        score += 1
+
+    if momentum_long or momentum_short:
+        score += 1
+
+    if price_long or price_short:
+        score += 1
+
+    if not_too_far:
+        score += 1
+
+    if volatility_ok:
+        score += 1
+
+    if score >= 6:
+        strength = "Strong"
+    elif score >= 4:
+        strength = "Medium"
+    else:
+        strength = "Weak"
+
+    # Reasons
+    if trend_1h_long:
+        reasons.append("روند 1h صعودی است.")
+    elif trend_1h_short:
+        reasons.append("روند 1h نزولی است.")
+    else:
+        reasons.append("روند 1h نامشخص است.")
+
+    if trend_15m_long:
+        reasons.append("روند 15m صعودی است.")
+    elif trend_15m_short:
+        reasons.append("روند 15m نزولی است.")
+    else:
+        reasons.append("روند 15m نامشخص است.")
+
+    if momentum_long:
+        reasons.append("مومنتوم 15m به نفع LONG است.")
+    elif momentum_short:
+        reasons.append("مومنتوم 15m به نفع SHORT است.")
+    else:
+        reasons.append("مومنتوم 15m ضعیف یا خنثی است.")
+
+    if not price_long and signal == "LONG":
+        reasons.append("قیمت بالای EMA50 نیست.")
+
+    if not price_short and signal == "SHORT":
+        reasons.append("قیمت پایین EMA50 نیست.")
+
+    if not not_too_far:
+        reasons.append(f"قیمت از EMA20 زیاد دور شده است: {distance_from_ema20:.3f}%")
+
+    if not volatility_ok:
+        reasons.append(f"نوسان کافی نیست: ATR% = {atr_percent:.3f}%")
+
+    if signal == "NO TRADE":
+        reasons.append("همه شروط ورود همزمان کامل نشده‌اند.")
+
+    # TP / SL
+    if signal == "LONG":
+        entry = price
+        tp = entry * (1 + TP_PERCENT / 100)
+        sl = entry * (1 - SL_PERCENT / 100)
+    elif signal == "SHORT":
+        entry = price
+        tp = entry * (1 - TP_PERCENT / 100)
+        sl = entry * (1 + SL_PERCENT / 100)
+    else:
+        entry = None
+        tp = None
+        sl = None
+
+    message = f"""
 PAXG SIGNAL BOT
 
 Symbol: {SYMBOL}
-Timeframe: {INTERVAL}
+Main Timeframe: 15m
+Confirm Timeframe: 1h
 
 Signal: {signal}
+Strength: {strength}
+
 Price: {price:.2f}
 
+--- 15m ---
 EMA20: {ema20:.2f}
 EMA50: {ema50:.2f}
 EMA200: {ema200:.2f}
-
 RSI: {rsi:.2f}
 MACD Hist: {macd_hist:.4f}
 ATR: {atr:.2f}
 ATR%: {atr_percent:.3f}%
 Distance from EMA20: {distance_from_ema20:.3f}%
 
+--- 1h ---
+EMA50: {ema50_1h:.2f}
+EMA200: {ema200_1h:.2f}
+RSI: {rsi_1h:.2f}
 """
 
-if signal in ["LONG", "SHORT"]:
-    message += f"""
+    if signal in ["LONG", "SHORT"]:
+        message += f"""
 Entry: {entry:.2f}
-TP: {tp:.2f}
-SL: {sl:.2f}
+TP ({TP_PERCENT}%): {tp:.2f}
+SL ({SL_PERCENT}%): {sl:.2f}
 """
-else:
-    message += "\nEntry: -\nTP: -\nSL: -\n"
+    else:
+        message += """
+Entry: -
+TP: -
+SL: -
+"""
 
-message += "\nReasons:\n"
-for r in reasons:
-    message += f"- {r}\n"
+    message += "\nReasons:\n"
+    for reason in reasons:
+        message += f"- {reason}\n"
 
-send_telegram(message)
-print(message)
+    return message
+
+
+if __name__ == "__main__":
+    try:
+        message = calculate_signal()
+        send_telegram(message)
+        print(message)
+    except Exception as e:
+        error_message = f"❌ PAXG Signal Bot Error:\n{str(e)}"
+        send_telegram(error_message)
+        raise
