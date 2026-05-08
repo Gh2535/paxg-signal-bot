@@ -1,4 +1,4 @@
-name: PAXG Signal Bot
+name: PAXG Signal Bot v2
 
 on:
   workflow_dispatch:
