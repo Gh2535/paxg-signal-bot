@@ -8,7 +8,7 @@ from ta.volatility import AverageTrueRange
 BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 
-SYMBOL = "PAXGUSDT"
+SYMBOL = "GOLDPAXGUSDT"
 INTERVAL = "15m"
 LIMIT = 200
 
