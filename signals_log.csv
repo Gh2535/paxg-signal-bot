@@ -1,0 +1,2 @@
+timestamp_utc,symbol,technical_signal,final_signal,block_reason,strength,price,entry,tp,sl,rsi_15m,macd_hist_15m,atr_percent,distance_from_ema20,ema50_15m,ema200_15m,ema50_1h,ema200_1h,rsi_1h,spread_percent,news_risk,news_summary
+2026-05-08 14:16:29,GOLD(PAXG)USDT,LONG,NO TRADE,ریسک خبری بالا است.,Medium,4723.9,,,,56.1135,1.834232,0.218033,0.158805,4711.851,4694.1088,4693.6691,4637.7632,56.0233,0.000423,HIGH,خبر مهم اقتصادی نزدیک است یا به‌تازگی منتشر شده؛ معامله ممنوع.
