@@ -4,7 +4,7 @@ import requests
 import pandas as pd
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
-from ta.trend import EMAIndicator, MACD
+from ta.trend import EMAIndicator, MACD, ADXIndicator
 from ta.momentum import RSIIndicator
 from ta.volatility import AverageTrueRange
 
@@ -31,9 +31,11 @@ PAPER_TRADES_FILE = "paper_trades.csv"
 
 MAX_OPEN_PAPER_TRADES = 1
 
-# Approximate round-trip fee assumption.
-# This is only for paper trading estimation, not exact exchange settlement.
 ESTIMATED_ROUND_TRIP_FEE_PERCENT = 0.04
+
+MIN_ADX_15M = 18.0
+MIN_VOLUME_RATIO = 0.45
+MAX_RECENT_MOVE_PERCENT = 0.75
 
 IMPORTANT_NEWS_KEYWORDS = [
     "cpi",
@@ -66,6 +68,7 @@ IMPORTANT_NEWS_KEYWORDS = [
 
 SIGNAL_FIELDNAMES = [
     "timestamp_utc",
+    "signal_candle_time",
     "symbol",
     "technical_signal",
     "final_signal",
@@ -77,6 +80,9 @@ SIGNAL_FIELDNAMES = [
     "sl",
     "rsi_15m",
     "macd_hist_15m",
+    "adx_15m",
+    "volume_ratio_15m",
+    "recent_move_percent",
     "atr_percent",
     "distance_from_ema20",
     "ema50_15m",
@@ -99,6 +105,8 @@ TRADE_FIELDNAMES = [
     "status",
     "open_time_utc",
     "close_time_utc",
+    "signal_candle_time",
+    "last_checked_candle_time",
     "entry",
     "tp",
     "sl",
@@ -116,6 +124,9 @@ TRADE_FIELDNAMES = [
     "strength_at_entry",
     "rsi_15m_at_entry",
     "macd_hist_15m_at_entry",
+    "adx_15m_at_entry",
+    "volume_ratio_15m_at_entry",
+    "recent_move_percent_at_entry",
     "atr_percent_at_entry",
     "spread_percent_at_entry",
     "news_risk_at_entry",
@@ -206,7 +217,22 @@ def add_indicators(df):
     )
     df["atr"] = atr.average_true_range()
 
+    adx = ADXIndicator(
+        high=df["high"],
+        low=df["low"],
+        close=df["close"],
+        window=14
+    )
+    df["adx"] = adx.adx()
+
+    df["volume_sma20"] = df["volume"].rolling(window=20).mean()
+
     return df
+
+
+def get_latest_closed_candle(df):
+    # آخرین کندل معمولاً در حال تشکیل است؛ برای تصمیم‌گیری از کندل بسته‌شده قبلی استفاده می‌کنیم.
+    return df.iloc[-2]
 
 
 def parse_finnhub_time(value):
@@ -404,7 +430,35 @@ def format_news_events(events):
     return text
 
 
+def ensure_csv_header(file_name, fieldnames):
+    file_path = Path(file_name)
+
+    if not file_path.exists():
+        return
+
+    try:
+        with open(file_path, mode="r", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            existing_rows = list(reader)
+            existing_fields = reader.fieldnames or []
+    except Exception:
+        return
+
+    if existing_fields == fieldnames:
+        return
+
+    with open(file_path, mode="w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+
+        for row in existing_rows:
+            cleaned = {field: row.get(field, "") for field in fieldnames}
+            writer.writerow(cleaned)
+
+
 def append_signal_log(row):
+    ensure_csv_header(SIGNALS_LOG_FILE, SIGNAL_FIELDNAMES)
+
     file_path = Path(SIGNALS_LOG_FILE)
     file_exists = file_path.exists()
 
@@ -418,6 +472,8 @@ def append_signal_log(row):
 
 
 def read_trades():
+    ensure_csv_header(PAPER_TRADES_FILE, TRADE_FIELDNAMES)
+
     file_path = Path(PAPER_TRADES_FILE)
 
     if not file_path.exists():
@@ -519,6 +575,7 @@ def update_open_paper_trades(latest_15m, now_utc):
     if not trades:
         return [], []
 
+    candle_time = str(int(latest_15m["time"]))
     high = float(latest_15m["high"])
     low = float(latest_15m["low"])
 
@@ -527,6 +584,9 @@ def update_open_paper_trades(latest_15m, now_utc):
 
     for trade in trades:
         if trade.get("status") != "OPEN":
+            continue
+
+        if trade.get("last_checked_candle_time") == candle_time:
             continue
 
         side = trade.get("side")
@@ -542,6 +602,7 @@ def update_open_paper_trades(latest_15m, now_utc):
 
         trade["max_high_seen"] = round(max_high_seen, 4)
         trade["min_low_seen"] = round(min_low_seen, 4)
+        trade["last_checked_candle_time"] = candle_time
 
         bars_held = parse_int(trade.get("bars_held"), 0) + 1
         trade["bars_held"] = bars_held
@@ -565,8 +626,6 @@ def update_open_paper_trades(latest_15m, now_utc):
             tp_hit = high >= tp
             sl_hit = low <= sl
 
-            # Conservative assumption:
-            # if both TP and SL touched in the same candle, count it as SL.
             if tp_hit and sl_hit:
                 close_reason = "TP_AND_SL_SAME_CANDLE_ASSUMED_SL"
                 exit_price = sl
@@ -651,6 +710,7 @@ def count_open_trades(trades):
 
 def create_paper_trade(
     now_utc,
+    signal_candle_time,
     side,
     entry,
     tp,
@@ -658,6 +718,9 @@ def create_paper_trade(
     strength,
     rsi,
     macd_hist,
+    adx,
+    volume_ratio,
+    recent_move_percent,
     atr_percent,
     spread_percent,
     news_risk,
@@ -672,6 +735,8 @@ def create_paper_trade(
         "status": "OPEN",
         "open_time_utc": now_utc.strftime("%Y-%m-%d %H:%M:%S"),
         "close_time_utc": "",
+        "signal_candle_time": signal_candle_time,
+        "last_checked_candle_time": signal_candle_time,
         "entry": round(entry, 4),
         "tp": round(tp, 4),
         "sl": round(sl, 4),
@@ -689,6 +754,9 @@ def create_paper_trade(
         "strength_at_entry": strength,
         "rsi_15m_at_entry": round(rsi, 4),
         "macd_hist_15m_at_entry": round(macd_hist, 6),
+        "adx_15m_at_entry": round(adx, 4),
+        "volume_ratio_15m_at_entry": round(volume_ratio, 4),
+        "recent_move_percent_at_entry": round(recent_move_percent, 4),
         "atr_percent_at_entry": round(atr_percent, 6),
         "spread_percent_at_entry": round(spread_percent, 6),
         "news_risk_at_entry": news_risk,
@@ -707,14 +775,15 @@ def calculate_signal():
 
     df_15m = get_klines(SYMBOL, "15m", LIMIT)
     df_15m = add_indicators(df_15m)
-    latest_15m = df_15m.iloc[-1]
+    latest_15m = get_latest_closed_candle(df_15m)
 
     df_1h = get_klines(SYMBOL, "60m", LIMIT)
     df_1h = add_indicators(df_1h)
-    latest_1h = df_1h.iloc[-1]
+    latest_1h = get_latest_closed_candle(df_1h)
 
-    # First update already-open paper trades.
     trades, trade_update_messages = update_open_paper_trades(latest_15m, now_utc)
+
+    signal_candle_time = str(int(latest_15m["time"]))
 
     price = latest_15m["close"]
 
@@ -725,6 +794,15 @@ def calculate_signal():
     rsi = latest_15m["rsi"]
     macd_hist = latest_15m["macd_hist"]
     atr = latest_15m["atr"]
+    adx = latest_15m["adx"]
+
+    volume = latest_15m["volume"]
+    volume_sma20 = latest_15m["volume_sma20"]
+
+    if volume_sma20 and volume_sma20 > 0:
+        volume_ratio = volume / volume_sma20
+    else:
+        volume_ratio = 0
 
     ema50_1h = latest_1h["ema50"]
     ema200_1h = latest_1h["ema200"]
@@ -748,6 +826,14 @@ def calculate_signal():
     atr_percent = atr / price * 100
     volatility_ok = atr_percent >= 0.10
 
+    adx_ok = adx >= MIN_ADX_15M
+
+    volume_ok = volume_ratio >= MIN_VOLUME_RATIO
+
+    recent_start_close = df_15m.iloc[-5]["close"]
+    recent_move_percent = abs(price - recent_start_close) / recent_start_close * 100
+    recent_move_ok = recent_move_percent <= MAX_RECENT_MOVE_PERCENT
+
     technical_signal = "NO TRADE"
 
     if (
@@ -757,6 +843,9 @@ def calculate_signal():
         and price_long
         and not_too_far
         and volatility_ok
+        and adx_ok
+        and volume_ok
+        and recent_move_ok
     ):
         technical_signal = "LONG"
 
@@ -767,6 +856,9 @@ def calculate_signal():
         and price_short
         and not_too_far
         and volatility_ok
+        and adx_ok
+        and volume_ok
+        and recent_move_ok
     ):
         technical_signal = "SHORT"
 
@@ -791,41 +883,40 @@ def calculate_signal():
 
     if trend_1h_long or trend_1h_short:
         score += 1
-
     if trend_15m_long or trend_15m_short:
         score += 1
-
     if momentum_long or momentum_short:
         score += 1
-
     if price_long or price_short:
         score += 1
-
     if not_too_far:
         score += 1
-
     if volatility_ok:
         score += 1
-
+    if adx_ok:
+        score += 1
+    if volume_ok:
+        score += 1
+    if recent_move_ok:
+        score += 1
     if spread_ok:
         score += 1
-
     if news_ok and news["risk"] in ["LOW", "MEDIUM"]:
         score += 1
 
-    if score >= 8:
+    if score >= 10:
         strength = "Strong"
-    elif score >= 6:
+    elif score >= 7:
         strength = "Medium"
     else:
         strength = "Weak"
 
     if final_signal == "LONG":
-        entry = price
+        entry = ask
         tp = entry * (1 + TP_PERCENT / 100)
         sl = entry * (1 - SL_PERCENT / 100)
     elif final_signal == "SHORT":
-        entry = price
+        entry = bid
         tp = entry * (1 - TP_PERCENT / 100)
         sl = entry * (1 + SL_PERCENT / 100)
     else:
@@ -841,6 +932,7 @@ def calculate_signal():
     if final_signal in ["LONG", "SHORT"] and current_open_trades < MAX_OPEN_PAPER_TRADES:
         new_trade = create_paper_trade(
             now_utc=now_utc,
+            signal_candle_time=signal_candle_time,
             side=final_signal,
             entry=entry,
             tp=tp,
@@ -848,6 +940,9 @@ def calculate_signal():
             strength=strength,
             rsi=rsi,
             macd_hist=macd_hist,
+            adx=adx,
+            volume_ratio=volume_ratio,
+            recent_move_percent=recent_move_percent,
             atr_percent=atr_percent,
             spread_percent=spread_percent,
             news_risk=news["risk"],
@@ -897,6 +992,21 @@ This is paper trading only. No real order was sent.
         reasons.append("مومنتوم 15m به نفع SHORT است.")
     else:
         reasons.append("مومنتوم 15m ضعیف یا خنثی است.")
+
+    if adx_ok:
+        reasons.append(f"قدرت روند با ADX قابل قبول است: {adx:.2f}")
+    else:
+        reasons.append(f"ADX ضعیف است؛ احتمال رنج بودن بازار بالاتر است: {adx:.2f}")
+
+    if volume_ok:
+        reasons.append(f"حجم قابل قبول است؛ Volume Ratio = {volume_ratio:.2f}")
+    else:
+        reasons.append(f"حجم ضعیف است؛ Volume Ratio = {volume_ratio:.2f}")
+
+    if recent_move_ok:
+        reasons.append(f"حرکت چند کندل اخیر بیش از حد تند نیست: {recent_move_percent:.3f}%")
+    else:
+        reasons.append(f"حرکت چند کندل اخیر تند بوده؛ ریسک تعقیب قیمت بالاست: {recent_move_percent:.3f}%")
 
     if not not_too_far:
         reasons.append(f"قیمت از EMA20 زیاد دور شده است: {distance_from_ema20:.3f}%")
@@ -960,6 +1070,7 @@ Final Signal: {final_signal}
 Strength: {strength}
 Block Reason: {block_reason_text}
 
+Signal Candle Time: {signal_candle_time}
 Price: {price:.2f}
 
 --- News Risk ---
@@ -975,17 +1086,20 @@ Ask: {ask:.2f}
 Spread: {spread_percent:.4f}%
 Max Allowed Spread: {MAX_SPREAD_PERCENT:.2f}%
 
---- 15m ---
+--- 15m Closed Candle ---
 EMA20: {ema20:.2f}
 EMA50: {ema50:.2f}
 EMA200: {ema200:.2f}
 RSI: {rsi:.2f}
 MACD Hist: {macd_hist:.4f}
+ADX: {adx:.2f}
 ATR: {atr:.2f}
 ATR%: {atr_percent:.3f}%
 Distance from EMA20: {distance_from_ema20:.3f}%
+Volume Ratio: {volume_ratio:.2f}
+Recent Move: {recent_move_percent:.3f}%
 
---- 1h ---
+--- 1h Closed Candle ---
 EMA50: {ema50_1h:.2f}
 EMA200: {ema200_1h:.2f}
 RSI: {rsi_1h:.2f}
@@ -1016,6 +1130,7 @@ SL: -
 
     append_signal_log({
         "timestamp_utc": now_utc.strftime("%Y-%m-%d %H:%M:%S"),
+        "signal_candle_time": signal_candle_time,
         "symbol": SYMBOL,
         "technical_signal": technical_signal,
         "final_signal": final_signal,
@@ -1027,6 +1142,9 @@ SL: -
         "sl": round(sl, 4) if sl else "",
         "rsi_15m": round(rsi, 4),
         "macd_hist_15m": round(macd_hist, 6),
+        "adx_15m": round(adx, 4),
+        "volume_ratio_15m": round(volume_ratio, 4),
+        "recent_move_percent": round(recent_move_percent, 4),
         "atr_percent": round(atr_percent, 6),
         "distance_from_ema20": round(distance_from_ema20, 6),
         "ema50_15m": round(ema50, 4),
