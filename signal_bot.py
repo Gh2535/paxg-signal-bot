@@ -1,6 +1,8 @@
 import os
+import csv
 import requests
 import pandas as pd
+from pathlib import Path
 from datetime import datetime, timedelta, timezone
 from ta.trend import EMAIndicator, MACD
 from ta.momentum import RSIIndicator
@@ -21,6 +23,8 @@ MAX_SPREAD_PERCENT = 0.10
 NEWS_BLOCK_BEFORE_MINUTES = 90
 NEWS_BLOCK_AFTER_MINUTES = 60
 NEWS_MEDIUM_LOOKAHEAD_HOURS = 24
+
+LOG_FILE = "signals_log.csv"
 
 IMPORTANT_NEWS_KEYWORDS = [
     "cpi",
@@ -332,7 +336,47 @@ def format_news_events(events):
     return text
 
 
+def append_signal_log(row):
+    file_path = Path(LOG_FILE)
+    file_exists = file_path.exists()
+
+    fieldnames = [
+        "timestamp_utc",
+        "symbol",
+        "technical_signal",
+        "final_signal",
+        "block_reason",
+        "strength",
+        "price",
+        "entry",
+        "tp",
+        "sl",
+        "rsi_15m",
+        "macd_hist_15m",
+        "atr_percent",
+        "distance_from_ema20",
+        "ema50_15m",
+        "ema200_15m",
+        "ema50_1h",
+        "ema200_1h",
+        "rsi_1h",
+        "spread_percent",
+        "news_risk",
+        "news_summary"
+    ]
+
+    with open(file_path, mode="a", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+
+        if not file_exists:
+            writer.writeheader()
+
+        writer.writerow(row)
+
+
 def calculate_signal():
+    now_utc = datetime.now(timezone.utc)
+
     news = get_news_risk()
     news_ok = news["trade_allowed"]
 
@@ -413,8 +457,6 @@ def calculate_signal():
             final_signal = "NO TRADE"
             block_reasons.append("ریسک خبری بالا است.")
 
-    reasons = []
-
     score = 0
 
     if trend_1h_long or trend_1h_short:
@@ -447,6 +489,8 @@ def calculate_signal():
         strength = "Medium"
     else:
         strength = "Weak"
+
+    reasons = []
 
     if trend_1h_long:
         reasons.append("روند 1h صعودی است.")
@@ -517,6 +561,40 @@ def calculate_signal():
     else:
         block_reason_text = "-"
 
+    should_send_message = (
+        final_signal in ["LONG", "SHORT"]
+        or technical_signal in ["LONG", "SHORT"]
+        or block_reasons
+    )
+
+    should_log_signal = should_send_message
+
+    if should_log_signal:
+        append_signal_log({
+            "timestamp_utc": now_utc.strftime("%Y-%m-%d %H:%M:%S"),
+            "symbol": SYMBOL,
+            "technical_signal": technical_signal,
+            "final_signal": final_signal,
+            "block_reason": block_reason_text,
+            "strength": strength,
+            "price": round(price, 4),
+            "entry": round(entry, 4) if entry else "",
+            "tp": round(tp, 4) if tp else "",
+            "sl": round(sl, 4) if sl else "",
+            "rsi_15m": round(rsi, 4),
+            "macd_hist_15m": round(macd_hist, 6),
+            "atr_percent": round(atr_percent, 6),
+            "distance_from_ema20": round(distance_from_ema20, 6),
+            "ema50_15m": round(ema50, 4),
+            "ema200_15m": round(ema200, 4),
+            "ema50_1h": round(ema50_1h, 4),
+            "ema200_1h": round(ema200_1h, 4),
+            "rsi_1h": round(rsi_1h, 4),
+            "spread_percent": round(spread_percent, 6),
+            "news_risk": news["risk"],
+            "news_summary": news["summary"]
+        })
+
     message = f"""
 PAXG SIGNAL BOT
 
@@ -577,14 +655,20 @@ SL: -
     for reason in reasons:
         message += f"- {reason}\n"
 
-    return message
+    return message, should_send_message
 
 
 if __name__ == "__main__":
     try:
-        message = calculate_signal()
-        send_telegram(message)
+        message, should_send_message = calculate_signal()
+
         print(message)
+
+        if should_send_message:
+            send_telegram(message)
+        else:
+            print("No important signal. Telegram message skipped.")
+
     except Exception as e:
         error_message = f"❌ PAXG Signal Bot Error:\n{str(e)}"
         send_telegram(error_message)
