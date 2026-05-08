@@ -26,6 +26,9 @@ NEWS_MEDIUM_LOOKAHEAD_HOURS = 24
 
 LOG_FILE = "signals_log.csv"
 
+# اگر در این مدت همان پیام قبلاً ثبت شده باشد، دوباره تلگرام نمی‌فرستد
+DUPLICATE_SUPPRESSION_MINUTES = 60
+
 IMPORTANT_NEWS_KEYWORDS = [
     "cpi",
     "consumer price",
@@ -362,7 +365,9 @@ def append_signal_log(row):
         "rsi_1h",
         "spread_percent",
         "news_risk",
-        "news_summary"
+        "news_summary",
+        "telegram_sent",
+        "duplicate_suppressed"
     ]
 
     with open(file_path, mode="a", newline="", encoding="utf-8") as f:
@@ -372,6 +377,52 @@ def append_signal_log(row):
             writer.writeheader()
 
         writer.writerow(row)
+
+
+def parse_log_timestamp(value):
+    try:
+        return datetime.strptime(value, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+    except Exception:
+        return None
+
+
+def is_duplicate_recent(now_utc, technical_signal, final_signal, block_reason):
+    file_path = Path(LOG_FILE)
+
+    if not file_path.exists():
+        return False
+
+    cutoff = now_utc - timedelta(minutes=DUPLICATE_SUPPRESSION_MINUTES)
+
+    try:
+        with open(file_path, mode="r", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            rows = list(reader)
+    except Exception:
+        return False
+
+    for row in reversed(rows):
+        row_time = parse_log_timestamp(row.get("timestamp_utc", ""))
+
+        if row_time is None:
+            continue
+
+        if row_time < cutoff:
+            break
+
+        same_state = (
+            row.get("technical_signal") == technical_signal
+            and row.get("final_signal") == final_signal
+            and row.get("block_reason") == block_reason
+        )
+
+        # فقط پیام‌هایی که قبلاً واقعاً به تلگرام رفته‌اند مانع تکرار شوند
+        was_sent = row.get("telegram_sent") == "yes"
+
+        if same_state and was_sent:
+            return True
+
+    return False
 
 
 def calculate_signal():
@@ -456,6 +507,11 @@ def calculate_signal():
         if not news_ok:
             final_signal = "NO TRADE"
             block_reasons.append("ریسک خبری بالا است.")
+
+    if block_reasons:
+        block_reason_text = " / ".join(block_reasons)
+    else:
+        block_reason_text = "-"
 
     score = 0
 
@@ -554,46 +610,25 @@ def calculate_signal():
         tp = None
         sl = None
 
-    news_events_text = format_news_events(news["events"])
-
-    if block_reasons:
-        block_reason_text = " / ".join(block_reasons)
-    else:
-        block_reason_text = "-"
-
-    should_send_message = (
+    should_send_message_raw = (
         final_signal in ["LONG", "SHORT"]
         or technical_signal in ["LONG", "SHORT"]
-        or block_reasons
+        or bool(block_reasons)
     )
 
-    should_log_signal = should_send_message
+    duplicate_recent = False
 
-    if should_log_signal:
-        append_signal_log({
-            "timestamp_utc": now_utc.strftime("%Y-%m-%d %H:%M:%S"),
-            "symbol": SYMBOL,
-            "technical_signal": technical_signal,
-            "final_signal": final_signal,
-            "block_reason": block_reason_text,
-            "strength": strength,
-            "price": round(price, 4),
-            "entry": round(entry, 4) if entry else "",
-            "tp": round(tp, 4) if tp else "",
-            "sl": round(sl, 4) if sl else "",
-            "rsi_15m": round(rsi, 4),
-            "macd_hist_15m": round(macd_hist, 6),
-            "atr_percent": round(atr_percent, 6),
-            "distance_from_ema20": round(distance_from_ema20, 6),
-            "ema50_15m": round(ema50, 4),
-            "ema200_15m": round(ema200, 4),
-            "ema50_1h": round(ema50_1h, 4),
-            "ema200_1h": round(ema200_1h, 4),
-            "rsi_1h": round(rsi_1h, 4),
-            "spread_percent": round(spread_percent, 6),
-            "news_risk": news["risk"],
-            "news_summary": news["summary"]
-        })
+    if should_send_message_raw:
+        duplicate_recent = is_duplicate_recent(
+            now_utc=now_utc,
+            technical_signal=technical_signal,
+            final_signal=final_signal,
+            block_reason=block_reason_text
+        )
+
+    should_send_message = should_send_message_raw and not duplicate_recent
+
+    news_events_text = format_news_events(news["events"])
 
     message = f"""
 PAXG SIGNAL BOT
@@ -655,6 +690,36 @@ SL: -
     for reason in reasons:
         message += f"- {reason}\n"
 
+    if duplicate_recent:
+        message += f"\nDuplicate Filter: پیام مشابه در {DUPLICATE_SUPPRESSION_MINUTES} دقیقه اخیر ارسال شده؛ تلگرام دوباره ارسال نمی‌شود.\n"
+
+    append_signal_log({
+        "timestamp_utc": now_utc.strftime("%Y-%m-%d %H:%M:%S"),
+        "symbol": SYMBOL,
+        "technical_signal": technical_signal,
+        "final_signal": final_signal,
+        "block_reason": block_reason_text,
+        "strength": strength,
+        "price": round(price, 4),
+        "entry": round(entry, 4) if entry else "",
+        "tp": round(tp, 4) if tp else "",
+        "sl": round(sl, 4) if sl else "",
+        "rsi_15m": round(rsi, 4),
+        "macd_hist_15m": round(macd_hist, 6),
+        "atr_percent": round(atr_percent, 6),
+        "distance_from_ema20": round(distance_from_ema20, 6),
+        "ema50_15m": round(ema50, 4),
+        "ema200_15m": round(ema200, 4),
+        "ema50_1h": round(ema50_1h, 4),
+        "ema200_1h": round(ema200_1h, 4),
+        "rsi_1h": round(rsi_1h, 4),
+        "spread_percent": round(spread_percent, 6),
+        "news_risk": news["risk"],
+        "news_summary": news["summary"],
+        "telegram_sent": "yes" if should_send_message else "no",
+        "duplicate_suppressed": "yes" if duplicate_recent else "no"
+    })
+
     return message, should_send_message
 
 
@@ -667,7 +732,7 @@ if __name__ == "__main__":
         if should_send_message:
             send_telegram(message)
         else:
-            print("No important signal. Telegram message skipped.")
+            print("No Telegram message sent.")
 
     except Exception as e:
         error_message = f"❌ PAXG Signal Bot Error:\n{str(e)}"
