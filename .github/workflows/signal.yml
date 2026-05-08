@@ -31,10 +31,10 @@ jobs:
           FINNHUB_API_KEY: ${{ secrets.FINNHUB_API_KEY }}
         run: python signal_bot.py
 
-      - name: Commit signal log
+      - name: Commit logs
         run: |
           git config user.name "github-actions"
           git config user.email "github-actions@github.com"
-          git add signals_log.csv
-          git diff --cached --quiet || git commit -m "Update signal log"
+          git add signals_log.csv paper_trades.csv
+          git diff --cached --quiet || git commit -m "Update signal and paper trade logs"
           git push
