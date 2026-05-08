@@ -81,7 +81,7 @@ def calculate_signal():
     latest_15m = df_15m.iloc[-1]
 
     # 1h data
-    df_1h = get_klines(SYMBOL, "1h", LIMIT)
+    df_1h = get_klines(SYMBOL, "60m", LIMIT)
     df_1h = add_indicators(df_1h)
     latest_1h = df_1h.iloc[-1]
 
