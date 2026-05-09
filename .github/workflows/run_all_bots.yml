@@ -56,12 +56,28 @@ jobs:
         run: |
           python btc_signal_bot.py
 
+      - name: Show changed files
+        run: |
+          echo "Changed files after bot run:"
+          git status --short
+
       - name: Commit updated logs
         run: |
           git config user.name "github-actions"
           git config user.email "github-actions@github.com"
 
-          git add signals_log.csv btc_signals_log.csv paper_trades.csv btc_paper_trades.csv || true
+          git add signals_log.csv || true
+          git add btc_signals_log.csv || true
+          git add paper_trades.csv || true
+
+          if [ -f btc_paper_trades.csv ]; then
+            git add btc_paper_trades.csv
+          else
+            echo "btc_paper_trades.csv does not exist yet, skipping."
+          fi
+
+          echo "Staged files:"
+          git diff --cached --name-only
 
           if git diff --cached --quiet; then
             echo "No log changes to commit."
